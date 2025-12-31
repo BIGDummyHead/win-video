@@ -23,16 +23,15 @@ use windows::Win32::{
 use windows::core::Interface;
 
 use crate::devices::DeviceSize;
+use crate::i_capture::ICapture;
 use crate::monitor_frame::MonitorFrame;
-
-pub type Frame = Vec<u8>;
 
 pub struct Monitor {
     /// The IDXGIOutputDuplication interface accesses and manipulates the duplicated desktop image.
     duplication_output: IDXGIOutputDuplication,
 
-    pub receiver: Arc<Mutex<Receiver<Frame>>>,
-    sender: Sender<Frame>,
+    pub receiver: Arc<Mutex<Receiver<Vec<u8>>>>,
+    sender: Sender<Vec<u8>>,
 
     is_sending: Arc<Mutex<bool>>,
 
@@ -54,7 +53,7 @@ impl Monitor {
     /// Create device information for a given monitor of your system.
     ///
     /// Provides a Monitor struct that has the ability to duplicate the data and do other manipulation.
-    pub unsafe fn from_monitor(monitor: u32) -> Result<Self, windows::core::Error> {
+    pub unsafe fn from_monitor(monitor: u32) -> Result<Arc<Self>, windows::core::Error> {
         unsafe {
             //choose default adapater
             let adapter = None;
@@ -115,7 +114,7 @@ impl Monitor {
 
             let staging_texture = Self::create_staging_texture(&device, &device_size)?;
 
-            Ok(Self {
+            Ok(Arc::new(Self {
                 duplication_output: dup_output,
                 sender: tx,
                 receiver: Arc::new(Mutex::new(rx)),
@@ -125,7 +124,7 @@ impl Monitor {
                 staging_texture,
                 desktop_size: device_size,
                 name: String::from_utf16_lossy(&desc.DeviceName),
-            })
+            }))
         }
     }
 
@@ -158,113 +157,46 @@ impl Monitor {
         Ok(staging_texture.unwrap())
     }
 
-    /// # Stop Cloning
-    ///
-    /// Safely stops the cloning of the monitor.
-    pub async fn stop_cloning(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut is_sending = self.is_sending.lock().await;
+    
+    
 
-        if !*is_sending {
-            return Err("Not sending any data".into());
+    /// Using the device's context map the staging texture to contain the monitor frame data
+    ///
+    /// Once mapped copy from the raw frame data into a Vec<u8>
+    fn map_resource(&self) -> Result<Vec<u8>, windows::core::Error> {
+        //we now have access to the data
+        let mut mapped_resource = D3D11_MAPPED_SUBRESOURCE::default();
+
+        unsafe {
+            self.device_context.Map(
+                &self.staging_texture,
+                0,
+                D3D11_MAP_READ,
+                0,
+                Some(&mut mapped_resource),
+            )?;
         }
 
-        *is_sending = false;
-        Ok(())
-    }
+        let row_pitch = mapped_resource.RowPitch as usize;
+        let total_size_bytes = row_pitch * self.desktop_size.height as usize;
 
-    /// # Start Cloning
-    ///
-    /// Starts cloning the given monitor from the system.
-    ///
-    /// Once cloning begins for the monitor it will start sending data to the monitor receiver.
-    ///
-    /// Please refer to MPSC on how to receive data asynchonously.
-    ///
-    /// ## Warning
-    ///
-    /// It is very important to note that this operation may only occurr on the main thread and is thread blocking.
-    ///
-    /// You must start a task that reads the data before starting cloning, you can then stop cloning the data inside of the newly started task.
-    pub async unsafe fn start_cloning(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let data: Option<Vec<u8>>;
 
-        {
-            let mut sending_lock = self.is_sending.lock().await;
+        unsafe {
+            data = Some(
+                std::slice::from_raw_parts(mapped_resource.pData as *const u8, total_size_bytes)
+                    .to_vec(),
+            );
 
-            if *sending_lock {
-                return Err("you are already cloning data".into());
-            }
-
-            *sending_lock = true;
+            //release all data.
+            self.device_context.Unmap(&self.staging_texture, 0);
         }
 
-        loop {
-            //take the lock, the value, and drop
-            let is_sending_currently = { *self.is_sending.lock().await };
-            if !is_sending_currently {
-                break;
-            }
-
-            unsafe {
-                let monitor_frame = self.acquire_data().await;
-
-                if let Err(e) = monitor_frame {
-                    //this is forgiveable, just no new data was accquired within the specified window time.
-                    if e.code() == DXGI_ERROR_WAIT_TIMEOUT.into() {
-                        continue;
-                    }
-
-                    // this is another error.
-                    return Err(Box::new(e));
-                }
-
-                let monitor_frame = monitor_frame.unwrap();
-
-                let mut frame_lock = self.frame.lock().await;
-                *frame_lock = monitor_frame;
-
-                let acquired_image = frame_lock.acquired_image.clone();
-
-                drop(frame_lock);
-
-                self.device_context
-                    .CopyResource(&self.staging_texture, acquired_image.as_ref().unwrap());
-
-                self.device_context.Flush();
-
-                //we now have access to the data
-                let mut mapped_resource = D3D11_MAPPED_SUBRESOURCE::default();
-
-                self.device_context.Map(
-                    &self.staging_texture,
-                    0,
-                    D3D11_MAP_READ,
-                    0,
-                    Some(&mut mapped_resource),
-                )?;
-
-                let row_pitch = mapped_resource.RowPitch as usize;
-                let total_size_bytes = row_pitch * self.desktop_size.height as usize;
-
-                let data = std::slice::from_raw_parts(
-                    mapped_resource.pData as *const u8,
-                    total_size_bytes,
-                )
-                .to_vec();
-
-                let send_res = self.sender.send(data).await;
-
-                //release all data.
-                self.device_context.Unmap(&self.staging_texture, 0);
-
-                self.release_frames().await?;
-
-                if let Err(e) = send_res {
-                    return Err(format!("Failed to send frame: {}", e).into());
-                }
-            }
+        if data.is_none() {
+            return Err(windows::Win32::Foundation::E_FAIL.into());
         }
 
-        Ok(())
+        Ok(data.unwrap())
     }
 
     // releases the frames and readies the monitor for another batch of duplication
@@ -352,6 +284,121 @@ impl Monitor {
                 frame_info,
             })
         }
+    }
+}
+
+impl ICapture for Monitor {
+    type CaptureOutput = Vec<u8>;
+
+    /// # Get Dimensions
+    /// 
+    /// Clones the demisions of the monitor
+    fn get_dimensions(&self) -> Result<DeviceSize, Box<dyn std::error::Error>> {
+        Ok(self.desktop_size.clone())
+    }
+
+    /// # Stop Cloning
+    ///
+    /// Safely stops the cloning of the monitor.
+    fn stop_capturing(
+        self: Arc<Self>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>
+    {
+        Box::pin(async move {
+            let mut is_sending = self.is_sending.lock().await;
+
+            if !*is_sending {
+                return Err("Not sending any data".into());
+            }
+
+            *is_sending = false;
+            Ok(())
+        })
+    }
+
+    /// # Start Capturing
+    ///
+    /// Starts cloning the given monitor from the system.
+    ///
+    /// Once cloning begins for the monitor it will start sending data to the monitor receiver.
+    ///
+    /// Please refer to MPSC on how to receive data asynchonously.
+    ///
+    /// ## Warning
+    ///
+    /// It is very important to note that this operation may only occurr on the main thread and is thread blocking.
+    ///
+    /// You must start a task that reads the data before starting cloning, you can then stop cloning the data inside of the newly started task.
+    fn start_capturing(
+        self: Arc<Self>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>
+    {
+        Box::pin(async move {
+            {
+                let mut sending_lock = self.is_sending.lock().await;
+
+                if *sending_lock {
+                    return Err("you are already cloning data".into());
+                }
+
+                *sending_lock = true;
+            }
+
+            loop {
+                //take the lock, the value, and drop
+                let is_sending_currently = { *self.is_sending.lock().await };
+                if !is_sending_currently {
+                    break;
+                }
+
+                unsafe {
+                    //retrieve the monitor frame currently, using the previous monitor frame on the self
+                    let monitor_frame = self.acquire_data().await;
+
+                    if let Err(e) = monitor_frame {
+                        //this is forgiveable, just no new data was accquired within the specified window time.
+                        if e.code() == DXGI_ERROR_WAIT_TIMEOUT.into() {
+                            continue;
+                        }
+
+                        // this is another error.
+                        return Err(e.into());
+                    }
+
+                    let monitor_frame = monitor_frame.unwrap();
+
+                    // update our current monitor frame with the newly acquired one
+                    let mut frame_lock = self.frame.lock().await;
+                    *frame_lock = monitor_frame;
+
+                    self.device_context.CopyResource(
+                        &self.staging_texture,
+                        frame_lock.acquired_image.as_ref().unwrap(),
+                    );
+
+                    drop(frame_lock);
+
+                    //flush the context of the copied resource.
+                    self.device_context.Flush();
+
+                    let data = self.map_resource()?;
+
+                    let send_res = self.sender.send(data).await;
+
+                    self.release_frames().await?;
+
+                    if let Err(e) = send_res {
+                        return Err(format!("Failed to send frame: {}", e).into());
+                    }
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    fn clone_receiver(&self) -> Arc<Mutex<Receiver<Self::CaptureOutput>>> {
+        self.receiver.clone()
     }
 }
 

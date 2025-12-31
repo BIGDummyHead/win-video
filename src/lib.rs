@@ -1,16 +1,16 @@
 pub mod devices;
 pub mod monitor;
 pub mod monitor_frame;
+pub mod i_capture;
 
 #[cfg(test)]
 mod tests {
 
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
-    use std::sync::Arc;
-
     use crate::devices::{VideoDevices, get_device_name};
     use crate::monitor::Monitor;
+    use crate::i_capture::ICapture;
 
     use windows::Win32::{
         Media::MediaFoundation::{
@@ -33,7 +33,7 @@ mod tests {
                 monitor.err()
             );
 
-            let monitor = Arc::new(monitor.unwrap());
+            let monitor = monitor.unwrap();
 
             let monitor_clone = monitor.clone();
 
@@ -61,12 +61,12 @@ mod tests {
                         break;
                     }
                 }
-                
-                let stopped = monitor_clone.stop_cloning().await;
+
+                let stopped = monitor_clone.stop_capturing().await;
                 assert!(stopped.is_ok());
             });
 
-            let clone = monitor.start_cloning().await;
+            let clone = monitor.start_capturing().await;
 
             assert!(clone.is_ok(), "{clone:?}");
         }
@@ -195,14 +195,13 @@ mod tests {
 
             assert!(activated_device.is_ok(), "{:?}", activated_device.err());
 
-            let activated_device = Arc::new(activated_device.unwrap());
+            let activated_device = activated_device.unwrap();
 
             println!("Activated Media Device Name: '{}'", activated_device.name);
 
             let receiver = activated_device.receiver.clone();
 
             let activated_device_clone = activated_device.clone();
-
             tokio::spawn(async move {
                 let mut receiver_guard = receiver.lock().await;
                 println!("Thread spawned, receiver initialized.");
@@ -214,16 +213,26 @@ mod tests {
                     let data = data.unwrap();
 
                     if data.len() > 0 {
-                        let stopped = (*activated_device_clone).stop_capturing().await;
+                        let stopped = activated_device_clone.stop_capturing().await;
 
                         assert!(stopped.is_ok());
                         break;
+
                     }
                 }
             });
 
-            let capturing = activated_device.start_capturing().await;
-            assert!(capturing.is_ok());
+            let spawned = tokio::spawn(async move {
+                let capturing = activated_device.start_capturing().await;
+                assert!(
+                    capturing.is_ok(),
+                    "Could not capture, failed at end: {:?}",
+                    capturing
+                );
+            })
+            .await;
+
+            assert!(spawned.is_ok(), "Failed to Join Task: {spawned:?}");
 
             devices.free_devices();
         }

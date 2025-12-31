@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+use std::{ffi::c_void, sync::Arc};
 
 use windows::Win32::{
     Media::MediaFoundation::{
@@ -76,12 +76,13 @@ impl<'a> VideoDevices<'a> {
         &self,
         device: &IMFActivate,
         output_type: Option<Output>,
-    ) -> Result<ActivatedDevice, windows::core::Error> {
+    ) -> Result<Arc<ActivatedDevice>, windows::core::Error> {
         unsafe {
             let name = get_device_name(device)?;
 
             let media_src = device
                 .ActivateObject::<windows::Win32::Media::MediaFoundation::IMFMediaSource>()?;
+
 
             Ok(ActivatedDevice::new(name, media_src, output_type)?)
         }

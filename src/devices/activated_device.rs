@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{pin::Pin, sync::Arc};
 
 use tokio::sync::{
     Mutex,
@@ -16,7 +16,7 @@ use windows::Win32::{
     },
 };
 
-use crate::devices::DeviceSize;
+use crate::{devices::DeviceSize, i_capture::ICapture};
 
 /// Output Control
 pub enum Output {
@@ -25,8 +25,6 @@ pub enum Output {
     /// Processes data as RGB32
     RGB32,
 }
-
-pub type VideoFrame = Vec<u8>;
 
 /// # Activated Device
 ///
@@ -41,10 +39,9 @@ pub struct ActivatedDevice {
     pub name: String,
     media_reader: IMFSourceReader,
 
-    pub receiver: Arc<Mutex<Receiver<VideoFrame>>>,
-    sender: Sender<VideoFrame>,
+    pub receiver: Arc<Mutex<Receiver<Vec<u8>>>>,
+    sender: Sender<Vec<u8>>,
     is_capturing: Arc<Mutex<bool>>,
-    pub size: Arc<DeviceSize>,
     pub output: Output,
 }
 
@@ -58,7 +55,7 @@ impl ActivatedDevice {
         name: String,
         source: IMFMediaSource,
         output: Option<Output>,
-    ) -> Result<Self, windows::core::Error> {
+    ) -> Result<Arc<Self>, windows::core::Error> {
         let output = output.unwrap_or(Output::NV12); //unwraps to NV12 by default
 
         unsafe {
@@ -66,8 +63,6 @@ impl ActivatedDevice {
 
             Self::set_stream_selection(&reader)?;
             Self::set_output_format(&reader, &output)?;
-
-            let size = Self::get_size(&reader)?;
 
             let (tx, rx) = mpsc::channel(1);
 
@@ -77,105 +72,56 @@ impl ActivatedDevice {
                 receiver: Arc::new(Mutex::new(rx)),
                 sender: tx,
                 is_capturing: Arc::new(Mutex::new(false)),
-                size: Arc::new(size),
                 output,
             };
 
-            return Ok(activated_device);
+            return Ok(Arc::new(activated_device));
         }
     }
 
-    /// ## Stop Captruing
+    /// # Read Sample
     ///
-    /// Safely stops capturing data.
-    pub async fn stop_capturing(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut cap_guard = self.is_capturing.lock().await;
+    /// Using the existing media readers takes in the video stream to read from (defaults to first video stream if None) a stream.
+    ///
+    /// Reads a sample of the stream, converts to a buffer and retrieves the underlying data returned as Vec<u8>
+    ///
+    pub fn read_sample(&self, video_stream: Option<u32>) -> Result<Vec<u8>, windows::core::Error> {
+        //initialize values for loading into the readsample func
+        let video_stream = video_stream.unwrap_or(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32);
+        let mut sample: Option<IMFSample> = None;
+        let buffer: Option<IMFMediaBuffer>;
+        let mut stream_index: u32 = 0;
+        let mut stream_flags: u32 = 0;
+        let mut time_stamp: i64 = 0;
 
-        if !*cap_guard {
-            return Err("already stopped.".into());
+        unsafe {
+            self.media_reader.ReadSample(
+                video_stream,
+                0,
+                Some(&mut stream_index),
+                Some(&mut stream_flags),
+                Some(&mut time_stamp),
+                Some(&mut sample),
+            )?;
+
+            if sample.is_none() {
+                return Ok(vec![]);
+            }
+
+            buffer = Some(sample.unwrap().ConvertToContiguousBuffer()?);
         }
 
-        *cap_guard = false;
+        //ensure the buffer contains some value.
+        if buffer.is_none() {
+            return Err(windows::Win32::Foundation::E_FAIL.into());
+        }
 
-        Ok(())
+        let buffer = buffer.unwrap();
+
+        Ok(Self::get_frame_data(&buffer)?)
     }
 
-    /// # Start Capturing
-    ///
-    /// Safely start capturing data. Once started you may use the attached receiver on the activated device.
-    ///
-    /// Please see MPSC if you are not familiar with how to receive the data.
-    ///
-    /// ## Warning
-    ///
-    /// This operation contains a loop and will block until stop_capturing is called...
-    ///
-    /// You must start this on your main thread. You may then create a task that controls the stop_capturing function as this struct is send+sync safe.
-    pub async fn start_capturing(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // lock the capguard, check if already capturing, if not set as true and continue
-        {
-            let mut cap_guard = self.is_capturing.lock().await;
-
-            if *cap_guard {
-                return Err("already capturing".into());
-            }
-
-            *cap_guard = true;
-        }
-
-        //clone all resources that need to be moved
-        let is_capturing_ref = self.is_capturing.clone();
-        let sender = self.sender.clone();
-        let media_reader = self.media_reader.clone();
-
-        loop {
-            //check if capturing, drop immediately
-            {
-                let is_capturing = is_capturing_ref.lock().await;
-
-                if !*is_capturing {
-                    break;
-                }
-            }
-
-            let first_video_stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
-            let mut pdwactualstreamindex: u32 = 0;
-            let mut pdwstreamflags: u32 = 0;
-            let mut plltimestamp: i64 = 0;
-
-            let mut sample: Option<IMFSample> = None;
-
-            unsafe {
-                media_reader.ReadSample(
-                    first_video_stream,
-                    0,
-                    Some(&mut pdwactualstreamindex),
-                    Some(&mut pdwstreamflags),
-                    Some(&mut plltimestamp),
-                    Some(&mut sample),
-                )?;
-
-                if sample.is_none() {
-                    continue;
-                }
-
-                let sample = sample.unwrap();
-
-                let buffer = sample.ConvertToContiguousBuffer()?;
-
-                let data = Self::get_frame_data(&buffer)?;
-                sender.send(data).await?;
-
-                buffer.Unlock()?;
-            }
-        }
-
-        Ok(())
-    }
-
-    unsafe fn get_frame_data(
-        buffer: &IMFMediaBuffer,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn get_frame_data(buffer: &IMFMediaBuffer) -> Result<Vec<u8>, windows::core::Error> {
         let mut pcbmaxlength: u32 = 0;
         let mut pcbcurrentlength: u32 = 0;
 
@@ -192,6 +138,8 @@ impl ActivatedDevice {
 
             let frame_data =
                 std::slice::from_raw_parts(ppbbuffer, pcbcurrentlength as usize).to_vec();
+
+            buffer.Unlock()?;
 
             Ok(frame_data)
         }
@@ -256,22 +204,111 @@ impl ActivatedDevice {
             Ok(reader)
         }
     }
+}
 
-    // retrieves the size of the stream (width + height) this is cached to the struct on creation
-    unsafe fn get_size(reader: &IMFSourceReader) -> Result<DeviceSize, windows::core::Error> {
+impl ICapture for ActivatedDevice {
+    type CaptureOutput = Vec<u8>;
+
+    /// # Get Dimensions
+    ///
+    /// Get the device size of the video camera.
+    fn get_dimensions(&self) -> Result<DeviceSize, Box<dyn std::error::Error>> {
+        let first_video_stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+        let size: Option<u64>;
+
+        //create unsafe calls to get the media type and the dimensions store as a u64
         unsafe {
-            let first_video_stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
-            let media_type = reader.GetCurrentMediaType(first_video_stream)?;
+            let media_type = self.media_reader.GetCurrentMediaType(first_video_stream)?;
 
-            let size: u64 = media_type.GetUINT64(&MF_MT_FRAME_SIZE)?;
-
-            let width = (size >> 32) as u32;
-            let height = (size & 0xFFFFFFFF) as u32;
-
-            let device_size = DeviceSize { width, height };
-
-            Ok(device_size)
+            size = Some(media_type.GetUINT64(&MF_MT_FRAME_SIZE)?);
         }
+
+        if size.is_none() {
+            return Err("Could not resolve size of device".into());
+        }
+
+        let size = size.unwrap();
+
+        let width = (size >> 32) as u32;
+        let height = (size & 0xFFFFFFFF) as u32;
+
+        Ok(DeviceSize { width, height })
+    }
+
+    /// ## Stop Captruing
+    ///
+    /// Safely stops capturing data.
+    fn stop_capturing(
+        self: Arc<Self>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>> {
+        Box::pin(async move {
+            let mut cap_guard = self.is_capturing.lock().await;
+
+            if !*cap_guard {
+                return Err("already stopped.".into());
+            }
+
+            *cap_guard = false;
+
+            Ok(())
+        })
+    }
+
+    /// # Start Capturing
+    ///
+    /// Safely start capturing data. Once started you may use the attached receiver on the activated device.
+    ///
+    /// Please see MPSC if you are not familiar with how to receive the data.
+    ///
+    /// ## Warning
+    ///
+    /// This operation contains a loop and will block until stop_capturing is called...
+    ///
+    /// You must start this on your main thread. You may then create a task that controls the stop_capturing function as this struct is send+sync safe.
+    fn start_capturing(
+        self: Arc<Self>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>> {
+        Box::pin(async move {
+            // lock the capguard, check if already capturing, if not set as true and continue
+            {
+                let mut cap_guard = self.is_capturing.lock().await;
+
+                if *cap_guard {
+                    return Err("already capturing".into());
+                }
+
+                *cap_guard = true;
+            }
+
+            //clone all resources that need to be moved
+            let is_capturing_ref = self.is_capturing.clone();
+            let sender = self.sender.clone();
+            loop {
+                //check if capturing, drop immediately
+                {
+                    let is_capturing = is_capturing_ref.lock().await;
+
+                    if !*is_capturing {
+                        break;
+                    }
+                }
+
+                let first_video_stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+
+                let data = self.read_sample(Some(first_video_stream))?;
+
+                sender.send(data).await?;
+            }
+
+            Ok(())
+        })
+    }
+
+    /// # Clone Receiver
+    ///
+    /// Clones the receiver that is attached to the video camera buffer.
+    fn clone_receiver(&self) -> Arc<Mutex<tokio::sync::mpsc::Receiver<Self::CaptureOutput>>> {
+        self.receiver.clone()
     }
 }
 
