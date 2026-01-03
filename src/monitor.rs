@@ -157,9 +157,6 @@ impl Monitor {
         Ok(staging_texture.unwrap())
     }
 
-    
-    
-
     /// Using the device's context map the staging texture to contain the monitor frame data
     ///
     /// Once mapped copy from the raw frame data into a Vec<u8>
@@ -211,79 +208,74 @@ impl Monitor {
 
     /// acquires a monitory frame based on previous monitor frames
     async unsafe fn acquire_data(&self) -> Result<MonitorFrame, windows::core::Error> {
+        let timeout_ms = 500;
+        let mut desktop_resource = None;
+        let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
+
         unsafe {
-            let timeout_ms = 500;
-            let mut desktop_resource: Option<windows::Win32::Graphics::Dxgi::IDXGIResource> = None;
-
-            let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
-
-            //acquire new frame
             self.duplication_output.AcquireNextFrame(
                 timeout_ms,
                 &mut frame_info,
                 &mut desktop_resource,
             )?;
+        }
 
-            // release the desktop resource after drop
-            let desktop_resource = desktop_resource.unwrap();
+        let desktop_resource = desktop_resource.unwrap();
+        let acquired_image = Some(desktop_resource.cast::<ID3D11Texture2D>()?);
 
-            let acquired_image = Some(desktop_resource.cast::<ID3D11Texture2D>()?);
+        let mut frame_lock = self.frame.lock().await;
+        let required_bytes = frame_info.TotalMetadataBufferSize as usize;
 
-            // indicates to use the previous
-            let mut moved_buffer = None;
-            let mut dirty_buffer = None;
-            let mut metadata_size = None;
+        if required_bytes > frame_lock.metadata_size as usize {
+            let move_unit = std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>();
+            let dirty_unit = std::mem::size_of::<RECT>();
 
-            let frame_lock = self.frame.lock().await;
+            frame_lock.moved_buffer.resize(
+                (required_bytes + move_unit - 1) / move_unit,
+                DXGI_OUTDUPL_MOVE_RECT::default(),
+            );
+            frame_lock.dirty_buffer.resize(
+                (required_bytes + dirty_unit - 1) / dirty_unit,
+                RECT::default(),
+            );
+            frame_lock.metadata_size = required_bytes as u32;
+        }
 
-            // old buffer too small, this is always called on the first hit
-            if frame_info.TotalMetadataBufferSize > frame_lock.metadata_size {
-                let new_buffer_size = frame_info.TotalMetadataBufferSize as usize;
+        let metadata_size = frame_lock.metadata_size;
+        let mut moved_buffer = std::mem::take(&mut frame_lock.moved_buffer);
+        let mut dirty_buffer = std::mem::take(&mut frame_lock.dirty_buffer);
+        drop(frame_lock);
 
-                //allocate new metadata buffer
-                moved_buffer = Some(vec![DXGI_OUTDUPL_MOVE_RECT::default(); new_buffer_size]);
-                dirty_buffer = Some(vec![RECT::default(); new_buffer_size]);
+        let mut move_bytes_returned = 0;
+        let mut dirty_bytes_returned = 0;
 
-                metadata_size = Some(new_buffer_size as u32);
-            }
-
-            let metadata_size = metadata_size.unwrap_or(frame_lock.metadata_size);
-
-            let mut moved_buffer = moved_buffer.unwrap_or(frame_lock.moved_buffer.clone());
-            let mut dirty_buffer = dirty_buffer.unwrap_or(frame_lock.dirty_buffer.clone());
-
-            //drop the ref
-            drop(frame_lock);
-
-            let mut move_bytes_returned: u32 = 0;
+        unsafe {
             self.duplication_output.GetFrameMoveRects(
-                metadata_size, // Use the full buffer capacity
+                metadata_size,
                 moved_buffer.as_mut_ptr(),
                 &mut move_bytes_returned,
             )?;
 
-            let moved_count =
-                move_bytes_returned / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>() as u32;
-
-            let mut dirty_bytes_returned: u32 = 0;
             self.duplication_output.GetFrameDirtyRects(
                 metadata_size,
                 dirty_buffer.as_mut_ptr(),
                 &mut dirty_bytes_returned,
             )?;
-
-            let dirty_count = dirty_bytes_returned / std::mem::size_of::<RECT>() as u32;
-
-            Ok(MonitorFrame {
-                acquired_image,
-                metadata_size,
-                moved_buffer,
-                dirty_buffer,
-                dirty_count,
-                moved_count,
-                frame_info,
-            })
         }
+
+        let moved_count =
+            move_bytes_returned / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>() as u32;
+        let dirty_count = dirty_bytes_returned / std::mem::size_of::<RECT>() as u32;
+
+        Ok(MonitorFrame {
+            acquired_image,
+            metadata_size,
+            moved_buffer,
+            dirty_buffer,
+            dirty_count,
+            moved_count,
+            frame_info,
+        })
     }
 }
 
@@ -291,7 +283,7 @@ impl ICapture for Monitor {
     type CaptureOutput = Vec<u8>;
 
     /// # Get Dimensions
-    /// 
+    ///
     /// Clones the demisions of the monitor
     fn get_dimensions(&self) -> Result<DeviceSize, Box<dyn std::error::Error>> {
         Ok(self.desktop_size.clone())
