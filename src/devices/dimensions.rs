@@ -1,9 +1,9 @@
 
 #[derive(Clone)]
-/// # Device Size
+/// # Dimensions
 /// 
 /// Simply a container that has a width and height
-pub struct DeviceSize {
+pub struct Dimensions {
     pub width: u32,
     pub height: u32
 }

@@ -1,3 +1,4 @@
+use crate::devices::monitor_info::MonitorInfo;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -22,10 +23,13 @@ use windows::Win32::{
 };
 use windows::core::Interface;
 
-use crate::devices::DeviceSize;
+use crate::devices::{Dimensions, get_monitor_count};
+use crate::devices::monitor_frame::MonitorFrame;
 use crate::i_capture::ICapture;
-use crate::monitor_frame::MonitorFrame;
 
+/// # Monitor
+///
+/// Reprents a monitor on your device, you can simply create one by using the from_monitor function
 pub struct Monitor {
     /// The IDXGIOutputDuplication interface accesses and manipulates the duplicated desktop image.
     duplication_output: IDXGIOutputDuplication,
@@ -42,19 +46,41 @@ pub struct Monitor {
     //texture that is used to copy from the GPU to CPU, expensive, so made on init
     staging_texture: ID3D11Texture2D,
 
-    pub desktop_size: DeviceSize,
+    pub desktop_size: Dimensions,
 
     pub name: String,
 }
 
 impl Monitor {
-    /// ## Create
+    /// # From Monitor Info
     ///
     /// Create device information for a given monitor of your system.
     ///
     /// Provides a Monitor struct that has the ability to duplicate the data and do other manipulation.
-    pub unsafe fn from_monitor(monitor: u32) -> Result<Arc<Self>, windows::core::Error> {
+    pub unsafe fn from_monitor_info(
+        monitor_info: MonitorInfo,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        let index = monitor_info.index;
+
+        unsafe { Self::from_monitor(index) }
+    }
+
+    /// ## From Monitor
+    ///
+    /// Create device information for a given monitor of your system.
+    ///
+    /// Provides a Monitor struct that has the ability to duplicate the data and do other manipulation.
+    pub unsafe fn from_monitor(monitor: u32) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         unsafe {
+            let max_monitors = get_monitor_count() as u32;
+
+            if monitor > max_monitors {
+                return Err(format!(
+                    "monitor index ({monitor}) fell outside of the max range of {max_monitors}"
+                )
+                .into());
+            }
+
             //choose default adapater
             let adapter = None;
 
@@ -103,7 +129,7 @@ impl Monitor {
 
             //get the size of the monitor
             let coordinates = &desc.DesktopCoordinates;
-            let device_size = DeviceSize {
+            let device_size = Dimensions {
                 width: (coordinates.right - coordinates.left) as u32,
                 height: (coordinates.bottom - coordinates.top) as u32,
             };
@@ -131,7 +157,7 @@ impl Monitor {
     /// creates a texture that can be used to copy GPU based monitor data to the CPU
     fn create_staging_texture(
         device: &ID3D11Device,
-        device_size: &DeviceSize,
+        device_size: &Dimensions,
     ) -> Result<ID3D11Texture2D, windows::core::Error> {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: device_size.width,
@@ -285,7 +311,7 @@ impl ICapture for Monitor {
     /// # Get Dimensions
     ///
     /// Clones the demisions of the monitor
-    fn get_dimensions(&self) -> Result<DeviceSize, Box<dyn std::error::Error>> {
+    fn get_dimensions(&self) -> Result<Dimensions, Box<dyn std::error::Error>> {
         Ok(self.desktop_size.clone())
     }
 

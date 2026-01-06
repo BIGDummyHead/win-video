@@ -10,7 +10,7 @@ use windows::Win32::{
 
 use windows::Win32::Foundation::E_FAIL;
 
-use crate::devices::{ActivatedDevice, activated_device::Output, get_device_name};
+use crate::devices::{Camera, camera::Output};
 
 /// # Device
 ///
@@ -19,12 +19,12 @@ use crate::devices::{ActivatedDevice, activated_device::Output, get_device_name}
 /// # Examples
 ///
 /// Examples to come!
-pub struct VideoDevices<'a> {
+pub struct Cameras<'a> {
     pub devices: Vec<&'a IMFActivate>,
     pp_devices: *mut Option<IMFActivate>,
 }
 
-impl<'a> VideoDevices<'a> {
+impl<'a> Cameras<'a> {
     /// # New
     ///
     /// Creates a new video devices struct.
@@ -76,20 +76,17 @@ impl<'a> VideoDevices<'a> {
         &self,
         device: &IMFActivate,
         output_type: Option<Output>,
-    ) -> Result<Arc<ActivatedDevice>, windows::core::Error> {
+    ) -> Result<Arc<Camera>, windows::core::Error> {
         unsafe {
-            let name = get_device_name(device)?;
-
             let media_src = device
                 .ActivateObject::<windows::Win32::Media::MediaFoundation::IMFMediaSource>()?;
 
-
-            Ok(ActivatedDevice::new(name, media_src, output_type)?)
+            Ok(Camera::new(media_src, output_type)?)
         }
     }
 
     /// # Free Devices
-    /// 
+    ///
     /// Uses CoTaskMemFree to free all devices that have been collected, this is essential for memory.
     pub unsafe fn free_devices(&self) {
         unsafe {
@@ -99,4 +96,3 @@ impl<'a> VideoDevices<'a> {
         }
     }
 }
-

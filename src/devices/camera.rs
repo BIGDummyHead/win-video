@@ -16,7 +16,7 @@ use windows::Win32::{
     },
 };
 
-use crate::{devices::DeviceSize, i_capture::ICapture};
+use crate::{devices::Dimensions, i_capture::ICapture};
 
 /// Output Control
 pub enum Output {
@@ -35,47 +35,51 @@ pub enum Output {
 /// Allows you to capture data (vec<u8>) data from a connected video device from your windows machine.
 ///
 /// This could be a webcam or some other type of video device. This data can then be pushed through a pipeline like OpenCV for data capturing or other sorts of projects.
-pub struct ActivatedDevice {
-    pub name: String,
+pub struct Camera {
+    // source reader that allows to get the bytes from the device
     media_reader: IMFSourceReader,
 
+    /// The receiver, can be used to grab data directly from the device.
     pub receiver: Arc<Mutex<Receiver<Vec<u8>>>>,
+
+    // to send data
     sender: Sender<Vec<u8>>,
+
+    // determines if the camera is capturing and sending data
     is_capturing: Arc<Mutex<bool>>,
+
+    /// The type of output the camera will give back to the user
     pub output: Output,
 }
 
-impl ActivatedDevice {
+impl Camera {
     /// Create a newly activated device from the IMFMediaSource provided by the activation and a name.
     ///
     /// The name should be the friendly name provided by the device before activation.
     ///
     /// Output is optional but will default to NV12 (raw)
     pub unsafe fn new(
-        name: String,
         source: IMFMediaSource,
         output: Option<Output>,
     ) -> Result<Arc<Self>, windows::core::Error> {
         let output = output.unwrap_or(Output::NV12); //unwraps to NV12 by default
+        let (tx, rx) = mpsc::channel(1);
 
         unsafe {
-            let reader = Self::create_reader(&source)?;
+            let media_reader = Self::create_reader(&source)?;
 
-            Self::set_stream_selection(&reader)?;
-            Self::set_output_format(&reader, &output)?;
+            Self::set_stream_selection(&media_reader)?;
+            Self::set_output_format(&media_reader, &output)?;
 
-            let (tx, rx) = mpsc::channel(1);
-
-            let activated_device = ActivatedDevice {
-                name,
-                media_reader: reader,
+            let activated = Camera {
+                media_reader,
                 receiver: Arc::new(Mutex::new(rx)),
                 sender: tx,
                 is_capturing: Arc::new(Mutex::new(false)),
                 output,
             };
 
-            return Ok(Arc::new(activated_device));
+            return Ok(Arc::new(activated));
         }
     }
 
@@ -206,13 +210,13 @@ impl ActivatedDevice {
     }
 }
 
-impl ICapture for ActivatedDevice {
+impl ICapture for Camera {
     type CaptureOutput = Vec<u8>;
 
     /// # Get Dimensions
     ///
     /// Get the device size of the video camera.
-    fn get_dimensions(&self) -> Result<DeviceSize, Box<dyn std::error::Error>> {
+    fn get_dimensions(&self) -> Result<Dimensions, Box<dyn std::error::Error>> {
         let first_video_stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
         let size: Option<u64>;
 
@@ -232,7 +236,7 @@ impl ICapture for ActivatedDevice {
         let width = (size >> 32) as u32;
         let height = (size & 0xFFFFFFFF) as u32;
 
-        Ok(DeviceSize { width, height })
+        Ok(Dimensions { width, height })
     }
 
     /// ## Stop Captruing
@@ -312,6 +316,6 @@ impl ICapture for ActivatedDevice {
     }
 }
 
-unsafe impl Send for ActivatedDevice {}
+unsafe impl Send for Camera {}
 
-unsafe impl Sync for ActivatedDevice {}
+unsafe impl Sync for Camera {}

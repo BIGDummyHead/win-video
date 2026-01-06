@@ -1,6 +1,4 @@
 pub mod devices;
-pub mod monitor;
-pub mod monitor_frame;
 pub mod i_capture;
 
 #[cfg(test)]
@@ -8,9 +6,7 @@ mod tests {
 
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
-    use crate::devices::{VideoDevices, get_device_name};
-    use crate::monitor::Monitor;
-    use crate::i_capture::ICapture;
+    use crate::{devices::{Cameras, Monitor, get_device_name}, i_capture::ICapture};
 
     use windows::Win32::{
         Media::MediaFoundation::{
@@ -123,7 +119,7 @@ mod tests {
     #[test]
     fn collect_devices() {
         unsafe {
-            let devices = VideoDevices::new();
+            let devices = Cameras::new();
 
             assert!(devices.is_ok());
 
@@ -155,7 +151,7 @@ mod tests {
                 "Co Initialize was not OK: {init}"
             );
 
-            let devices = VideoDevices::new();
+            let devices = Cameras::new();
 
             assert!(devices.is_ok());
 
@@ -166,10 +162,6 @@ mod tests {
             let activated_device = devices.activate_device(devices.devices[0], None);
 
             assert!(activated_device.is_ok(), "{:?}", activated_device.err());
-
-            let activated_device = activated_device.unwrap();
-
-            println!("Activated Media Device Name: '{}'", activated_device.name);
         }
     }
 
@@ -183,7 +175,7 @@ mod tests {
                 "Co Initialize was not OK: {init}"
             );
 
-            let devices = VideoDevices::new();
+            let devices = Cameras::new();
 
             assert!(devices.is_ok());
 
@@ -197,7 +189,6 @@ mod tests {
 
             let activated_device = activated_device.unwrap();
 
-            println!("Activated Media Device Name: '{}'", activated_device.name);
 
             let receiver = activated_device.receiver.clone();
 

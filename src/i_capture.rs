@@ -2,7 +2,7 @@ use std::{pin::Pin, sync::Arc};
 
 use tokio::sync::{Mutex, mpsc::Receiver};
 
-use crate::devices::DeviceSize;
+use crate::devices::Dimensions;
 
 /// # I Capture
 /// 
@@ -17,7 +17,7 @@ pub trait ICapture: Send + Sync {
     /// Retrieve the device dimensions of the capture.
     /// 
     /// This could be used to capture the size of a monitor for example (1920x1080)
-    fn get_dimensions(&self) -> Result<DeviceSize, Box<dyn std::error::Error>>;
+    fn get_dimensions(&self) -> Result<Dimensions, Box<dyn std::error::Error>>;
 
     /// # Stop Capturing
     /// 
